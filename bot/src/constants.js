@@ -8,6 +8,7 @@ import { ethers } from "ethers";
 import { logError } from "./logging.js";
 
 const IUniswapV2PairAbi = require("./abi/IUniswapV2Pair.json");
+const IUniswapV2FactoryAbi = require('./abi/IUniswapV2Factory.json');
 
 let hasEnv = true;
 
@@ -41,21 +42,26 @@ export const CONTRACTS = {
 // Helpful tokens for testing
 export const TOKENS = {
   WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-  USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  USDC: "0x2f3A40A3db8a7e3D09B0adfEfbCe4f6F81927557",
 };
 
 // Providers
-export const provider = new ethers.providers.JsonRpcProvider(
+export const provider = new ethers.JsonRpcProvider(
   process.env.RPC_URL
 );
-export const wssProvider = new ethers.providers.WebSocketProvider(
+
+export const wssProvider = new ethers.WebSocketProvider(
   process.env.RPC_URL_WSS
+);
+
+export const txnProvider = new ethers.JsonRpcProvider(
+  "https://mainnet.infura.io/v3/e2399f0ccfae4151bd31fb2b1487c91e"
 );
 
 // Used to send transactions, needs ether
 export const searcherWallet = new ethers.Wallet(
   process.env.PRIVATE_KEY,
-  wssProvider
+  txnProvider
 );
 
 // Used to sign flashbots headers doesn't need any ether
@@ -66,7 +72,13 @@ export const authKeyWallet = new ethers.Wallet(
 
 // Common contracts
 export const uniswapV2Pair = new ethers.Contract(
-  ethers.constants.AddressZero,
+  ethers.ZeroAddress,
   IUniswapV2PairAbi,
+  searcherWallet
+);
+
+export const uniswapV2FACTORY = new ethers.Contract(
+  "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+  IUniswapV2FactoryAbi,
   searcherWallet
 );

@@ -1,12 +1,13 @@
 import { ethers } from "ethers";
-import { uniswapV2Pair } from "./constants.js";
 import { match } from "./utils.js";
+import IUniswapV2PairAbi from './abi/IUniswapV2Pair.json' assert { type: "json" };
+import { searcherWallet } from "./constants.js";
 
 /* 
   Sorts tokens
 */
 export const sortTokens = (tokenA, tokenB) => {
-  if (ethers.BigNumber.from(tokenA).lt(ethers.BigNumber.from(tokenB))) {
+  if (BigInt(tokenA) < BigInt(tokenB)) {
     return [tokenA, tokenB];
   }
   return [tokenB, tokenA];
@@ -18,11 +19,11 @@ export const sortTokens = (tokenA, tokenB) => {
 export const getUniv2PairAddress = (tokenA, tokenB) => {
   const [token0, token1] = sortTokens(tokenA, tokenB);
 
-  const salt = ethers.utils.keccak256(token0 + token1.replace("0x", ""));
-  const address = ethers.utils.getCreate2Address(
+  // const salt = ethers.utils.keccak256(token0 + token1.replace("0x", ""));
+  const address = ethers.getCreate2Address(
     "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f", // Factory address (contract creator)
-    salt,
-    "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f" // init code hash
+    ethers.solidityPackedKeccak256(['address', 'address'], [token0, token1]),
+    ethers.keccak256("0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f") // init code hash
   );
 
   return address;
@@ -33,7 +34,8 @@ export const getUniv2PairAddress = (tokenA, tokenB) => {
 */
 export const getUniv2Reserve = async (pair, tokenA, tokenB) => {
   const [token0] = sortTokens(tokenA, tokenB);
-  const [reserve0, reserve1] = await uniswapV2Pair.attach(pair).getReserves();
+  const uniswapV2Pair = new ethers.Contract(pair, IUniswapV2PairAbi, searcherWallet);
+  const [reserve0, reserve1, lastDead] = await uniswapV2Pair.getReserves();
 
   if (match(tokenA, token0)) {
     return [reserve0, reserve1];

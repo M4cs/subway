@@ -21,7 +21,7 @@ export const fbRequest = async (url, method, params) => {
     jsonrpc: "2.0",
   });
 
-  const signature = await authKeyWallet.signMessage(ethers.utils.id(body));
+  const signature = await authKeyWallet.signMessage(ethers.id(body));
   const headers = {
     "X-Flashbots-Signature": `${authKeyWallet.address}:${signature}`,
     "Content-Type": "application/json",
@@ -112,7 +112,7 @@ export const getRawTransaction = (tx) => {
   let raw;
   let txData = stringifyBN(tx, true);
 
-  const common = new Common({ chain: "mainnet", hardfork: "london" });
+  const common = new Common({ chain: "mainnet", hardfork: "shanghai" });
 
   if (tx.type === null || tx.type === 0) {
     raw =
@@ -134,7 +134,7 @@ export const getRawTransaction = (tx) => {
     throw new Error("Invalid tx type");
   }
 
-  if (ethers.utils.keccak256(raw) !== tx.hash) {
+  if (ethers.keccak256(raw) !== tx.hash) {
     throw new Error("Invalid tx signature");
   }
 

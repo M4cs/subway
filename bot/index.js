@@ -1,6 +1,6 @@
 import { formatUnits } from "@ethersproject/units";
 import { ethers } from "ethers";
-import { CONTRACTS, wssProvider, searcherWallet } from "./src/constants.js";
+import { CONTRACTS, wssProvider, searcherWallet, provider } from "./src/constants.js";
 import {
   logDebug,
   logError,
@@ -23,9 +23,68 @@ import {
   getUniv2Reserve,
 } from "./src/univ2.js";
 import { calcNextBlockBaseFee, match, stringifyBN } from "./src/utils.js";
+import retry from 'async-retry';
+import { Network, Alchemy } from 'alchemy-sdk';
 
+const alcSettings = {
+  apiKey: 'Nmy2naEkUaENmxoqxEZTip6CzWS3FNek',
+  network: Network.ETH_MAINNET
+}
+
+const alchemy = new Alchemy(alcSettings);
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 // Note: You'll probably want to break this function up
 //       handling everything in here so you can follow along easily
+
+const fetchTxnWithRetries = async (txHash) => {
+  const result = await retry(
+    async () => {
+      try {
+        const txn = await wssProvider.getTransaction(txHash);
+        return txn;
+      } catch (e) {
+        throw new Error('HTTP 429');
+      }
+    },
+    {
+      retries: 5,
+      factor: 2,
+      minTimeout: 1000,
+      maxTimeout: 60000,
+      randomize: true
+    }
+  );
+  
+  return result;
+}
+
+
+const fetchRecpWithRetries = async (txHash) => {
+  const result = await retry(
+    async () => {
+      try {
+        const txRecp = await alchemy.core.getTransactionReceipt(txHash);
+        return txRecp;
+      } catch (e) {
+        throw new Error('HTTP 429');
+      }
+    },
+    {
+      retries: 5,
+      factor: 2,
+      minTimeout: 2000,
+      maxTimeout: 60000,
+      randomize: true
+    }
+  );
+  
+  return result;
+}
+
+
 const sandwichUniswapV2RouterTx = async (txHash) => {
   const strLogPrefix = `txhash=${txHash}`;
 
@@ -33,16 +92,15 @@ const sandwichUniswapV2RouterTx = async (txHash) => {
   logTrace(strLogPrefix, "received");
 
   // Get tx data
-  const [tx, txRecp] = await Promise.all([
-    wssProvider.getTransaction(txHash),
-    wssProvider.getTransactionReceipt(txHash),
-  ]);
+
+  const txRecp = await fetchRecpWithRetries(txHash);
 
   // Make sure transaction hasn't been mined
   if (txRecp !== null) {
     return;
   }
-
+  
+  const tx = await fetchTxnWithRetries(txHash);
   // Sometimes tx is null for some reason
   if (tx === null) {
     return;
@@ -58,11 +116,29 @@ const sandwichUniswapV2RouterTx = async (txHash) => {
   // Decode transaction data
   // i.e. is this swapExactETHForToken?
   // You'll have to decode all the other possibilities :P
+  logDebug(`Decoding Router Data: ${txHash}`);
   const routerDataDecoded = parseUniv2RouterTx(tx.data);
 
   // Basically means its not swapExactETHForToken and you need to add
   // other possibilities
   if (routerDataDecoded === null) {
+    return;
+  }
+
+  const decode = routerDataDecoded;
+  const { data } = decode;
+
+  if (data.name == "addLiquidityETH") {
+    logDebug(`Found addLiquidity Txn`);
+    const {
+      token,
+      amountTokenDesired,
+      amountTokenMin,
+      amountETHMin,
+      to,
+      deadline
+    } = decode;
+    logDebug(decode);
     return;
   }
 
@@ -73,6 +149,8 @@ const sandwichUniswapV2RouterTx = async (txHash) => {
   if (new Date().getTime() / 1000 > deadline) {
     return;
   }
+
+  logInfo(`Checking min recv for token after WETH`);
 
   // Get the min recv for token directly after WETH
   const userMinRecv = await getUniv2ExactWethTokenMinRecv(amountOutMin, path);
@@ -92,200 +170,220 @@ const sandwichUniswapV2RouterTx = async (txHash) => {
 
   // Note: Since this is swapExactETHForTokens, the path will always be like so
   // Get the optimal in amount
-  const [weth, token] = path;
-  const pairToSandwich = getUniv2PairAddress(weth, token);
-  const [reserveWeth, reserveToken] = await getUniv2Reserve(
-    pairToSandwich,
-    weth,
-    token
-  );
-  const optimalWethIn = calcSandwichOptimalIn(
-    userAmountIn,
-    userMinRecv,
-    reserveWeth,
-    reserveToken
-  );
-
-  // Lmeow, nothing to sandwich!
-  if (optimalWethIn.lte(ethers.constants.Zero)) {
-    return;
-  }
-
-  // Contains 3 states:
-  // 1: Frontrun state
-  // 2: Victim state
-  // 3: Backrun state
-  const sandwichStates = calcSandwichState(
-    optimalWethIn,
-    userAmountIn,
-    userMinRecv,
-    reserveWeth,
-    reserveToken
-  );
-
-  // Sanity check failed
-  if (sandwichStates === null) {
-    logDebug(
-      strLogPrefix,
-      "sandwich sanity check failed",
-      JSON.stringify(
-        stringifyBN({
-          optimalWethIn,
-          reserveToken,
-          reserveWeth,
-          userAmountIn,
-          userMinRecv,
-        })
-      )
-    );
-    return;
-  }
-
-  // Cool profitable sandwich :)
-  // But will it be post gas?
-  logInfo(
-    strLogPrefix,
-    "sandwichable target found",
-    JSON.stringify(stringifyBN(sandwichStates))
-  );
-
-  // Get block data to compute bribes etc
-  // as bribes calculation has correlation with gasUsed
-  const block = await wssProvider.getBlock();
-  const targetBlockNumber = block.number + 1;
-  const nextBaseFee = calcNextBlockBaseFee(block);
-  const nonce = await wssProvider.getTransactionCount(searcherWallet.address);
-
-  // Craft our payload
-  const frontslicePayload = ethers.utils.solidityPack(
-    ["address", "address", "uint128", "uint128", "uint8"],
-    [
-      token,
-      pairToSandwich,
-      optimalWethIn,
-      sandwichStates.frontrun.amountOut,
-      ethers.BigNumber.from(token).lt(ethers.BigNumber.from(weth)) ? 0 : 1,
-    ]
-  );
-  const frontsliceTx = {
-    to: CONTRACTS.SANDWICH,
-    from: searcherWallet.address,
-    data: frontslicePayload,
-    chainId: 1,
-    maxPriorityFeePerGas: 0,
-    maxFeePerGas: nextBaseFee,
-    gasLimit: 250000,
-    nonce,
-    type: 2,
-  };
-  const frontsliceTxSigned = await searcherWallet.signTransaction(frontsliceTx);
-
-  const middleTx = getRawTransaction(tx);
-
-  const backslicePayload = ethers.utils.solidityPack(
-    ["address", "address", "uint128", "uint128", "uint8"],
-    [
-      weth,
-      pairToSandwich,
-      sandwichStates.frontrun.amountOut,
-      sandwichStates.backrun.amountOut,
-      ethers.BigNumber.from(weth).lt(ethers.BigNumber.from(token)) ? 0 : 1,
-    ]
-  );
-  const backsliceTx = {
-    to: CONTRACTS.SANDWICH,
-    from: searcherWallet.address,
-    data: backslicePayload,
-    chainId: 1,
-    maxPriorityFeePerGas: 0,
-    maxFeePerGas: nextBaseFee,
-    gasLimit: 250000,
-    nonce: nonce + 1,
-    type: 2,
-  };
-  const backsliceTxSigned = await searcherWallet.signTransaction(backsliceTx);
-
-  // Simulate tx to get the gas used
-  const signedTxs = [frontsliceTxSigned, middleTx, backsliceTxSigned];
-  const simulatedResp = await callBundleFlashbots(signedTxs, targetBlockNumber);
-
-  // Try and check all the errors
   try {
-    sanityCheckSimulationResponse(simulatedResp);
-  } catch (e) {
-    logError(
+    logDebug(`Building swapExactETHForTokens Txn: ${txHash}`);
+    const [weth, token] = path;
+    const pairToSandwich = getUniv2PairAddress(weth, token);
+    logDebug(`WETH: ${weth} | TOKEN: ${token} | PAIR: ${pairToSandwich}`);
+    let reserveWeth, reserveToken;
+    try {
+      [reserveWeth, reserveToken] = await getUniv2Reserve(
+        pairToSandwich,
+        weth,
+        token
+      );
+    } catch (e) {
+      logError(e);
+      return;
+    }
+    logDebug(`Calculating Optimal ETH In: ${txHash}`);
+    const optimalWethIn = calcSandwichOptimalIn(
+      userAmountIn,
+      userMinRecv,
+      reserveWeth,
+      reserveToken
+    );
+  
+    logDebug(`Optimal ETH In: ${txHash}`)
+  
+    // Lmeow, nothing to sandwich!
+    if (optimalWethIn.lte(ethers.constants.Zero)) {
+      throw new Error(`Nothing to sandwich: ${txHash}`);
+    }
+  
+    // Contains 3 states:
+    // 1: Frontrun state
+    // 2: Victim state
+    // 3: Backrun state
+    logDebug(`Calculating Sandwich State: ${txHash}`);
+    const sandwichStates = calcSandwichState(
+      optimalWethIn,
+      userAmountIn,
+      userMinRecv,
+      reserveWeth,
+      reserveToken
+    );
+  
+    // Sanity check failed
+    if (sandwichStates === null) {
+      logDebug(
+        strLogPrefix,
+        "sandwich sanity check failed",
+        JSON.stringify(
+          stringifyBN({
+            optimalWethIn,
+            reserveToken,
+            reserveWeth,
+            userAmountIn,
+            userMinRecv,
+          })
+        )
+      );
+      return;
+    }
+  
+    // Cool profitable sandwich :)
+    // But will it be post gas?
+    logInfo(
       strLogPrefix,
-      "error while simulating",
+      "sandwichable target found",
+      JSON.stringify(stringifyBN(sandwichStates))
+    );
+  
+    // Get block data to compute bribes etc
+    // as bribes calculation has correlation with gasUsed
+    const block = await wssProvider.getBlock();
+    const targetBlockNumber = block.number + 1;
+    const nextBaseFee = calcNextBlockBaseFee(block);
+    const nonce = await wssProvider.getTransactionCount(searcherWallet.address);
+  
+    // Craft our payload
+    const frontslicePayload = ethers.solidityPacked(
+      ["address", "address", "uint128", "uint128", "uint8"],
+      [
+        token,
+        pairToSandwich,
+        optimalWethIn,
+        sandwichStates.frontrun.amountOut,
+        ethers.BigNumber.from(token).lt(ethers.BigNumber.from(weth)) ? 0 : 1,
+      ]
+    );
+    const frontsliceTx = {
+      to: CONTRACTS.SANDWICH,
+      from: searcherWallet.address,
+      data: frontslicePayload,
+      chainId: 1,
+      maxPriorityFeePerGas: 0,
+      maxFeePerGas: nextBaseFee,
+      gasLimit: 250000,
+      nonce,
+      type: 2,
+    };
+    const frontsliceTxSigned = await searcherWallet.signTransaction(frontsliceTx);
+    
+    const middleTx = getRawTransaction(tx);
+  
+    const backslicePayload = ethers.solidityPacked(
+      ["address", "address", "uint128", "uint128", "uint8"],
+      [
+        weth,
+        pairToSandwich,
+        sandwichStates.frontrun.amountOut,
+        sandwichStates.backrun.amountOut,
+        ethers.BigNumber.from(weth).lt(ethers.BigNumber.from(token)) ? 0 : 1,
+      ]
+    );
+    const backsliceTx = {
+      to: CONTRACTS.SANDWICH,
+      from: searcherWallet.address,
+      data: backslicePayload,
+      chainId: 1,
+      maxPriorityFeePerGas: 0,
+      maxFeePerGas: nextBaseFee,
+      gasLimit: 250000,
+      nonce: nonce + 1,
+      type: 2,
+    };
+    const backsliceTxSigned = await searcherWallet.signTransaction(backsliceTx);
+  
+    // Simulate tx to get the gas used
+    const signedTxs = [frontsliceTxSigned, middleTx, backsliceTxSigned];
+    const simulatedResp = await callBundleFlashbots(signedTxs, targetBlockNumber);
+  
+    // Try and check all the errors
+    try {
+      logInfo(
+        `Sanity checking simulationResp!`
+      )
+      sanityCheckSimulationResponse(simulatedResp);
+    } catch (e) {
+      logError(
+        strLogPrefix,
+        "error while simulating",
+        JSON.stringify(
+          stringifyBN({
+            error: e,
+            block,
+            targetBlockNumber,
+            nextBaseFee,
+            nonce,
+            sandwichStates,
+            frontsliceTx,
+            backsliceTx,
+          })
+        )
+      );
+  
+      return;
+    }
+  
+    // Extract gas
+    const frontsliceGas = ethers.BigNumber.from(simulatedResp.results[0].gasUsed);
+    const backsliceGas = ethers.BigNumber.from(simulatedResp.results[2].gasUsed);
+  
+    // Bribe 99.99% :P
+    const bribeAmount = sandwichStates.revenue.sub(
+      frontsliceGas.mul(nextBaseFee)
+    );
+    const maxPriorityFeePerGas = bribeAmount
+      .mul(9999)
+      .div(10000)
+      .div(backsliceGas);
+  
+    // Note: you probably want some circuit breakers here so you don't lose money
+    // if you fudged shit up
+  
+    // If 99.99% bribe isn't enough to cover base fee, its not worth it
+    if (maxPriorityFeePerGas.lt(nextBaseFee)) {
+      logTrace(
+        strLogPrefix,
+        `maxPriorityFee (${formatUnits(
+          maxPriorityFeePerGas,
+          9
+        )}) gwei < nextBaseFee (${formatUnits(nextBaseFee, 9)}) gwei`
+      );
+      return;
+    }
+  
+    // Okay, update backslice tx
+    const backsliceTxSignedWithBribe = await searcherWallet.signTransaction({
+      ...backsliceTx,
+      maxPriorityFeePerGas,
+    });
+  
+    // Fire the bundles
+    const bundleResp = await sendBundleFlashbots(
+      [frontsliceTxSigned, middleTx, backsliceTxSignedWithBribe],
+      targetBlockNumber
+    );
+    logSuccess(
+      strLogPrefix,
+      "Bundle submitted!",
       JSON.stringify(
-        stringifyBN({
-          error: e,
-          block,
-          targetBlockNumber,
-          nextBaseFee,
-          nonce,
-          sandwichStates,
-          frontsliceTx,
-          backsliceTx,
-        })
+        block,
+        targetBlockNumber,
+        nextBaseFee,
+        nonce,
+        sandwichStates,
+        frontsliceTx,
+        maxPriorityFeePerGas,
+        bundleResp
       )
     );
-
-    return;
+  } catch (e) {
+    logError(e);
+    throw e;
   }
-
-  // Extract gas
-  const frontsliceGas = ethers.BigNumber.from(simulatedResp.results[0].gasUsed);
-  const backsliceGas = ethers.BigNumber.from(simulatedResp.results[2].gasUsed);
-
-  // Bribe 99.99% :P
-  const bribeAmount = sandwichStates.revenue.sub(
-    frontsliceGas.mul(nextBaseFee)
-  );
-  const maxPriorityFeePerGas = bribeAmount
-    .mul(9999)
-    .div(10000)
-    .div(backsliceGas);
-
-  // Note: you probably want some circuit breakers here so you don't lose money
-  // if you fudged shit up
-
-  // If 99.99% bribe isn't enough to cover base fee, its not worth it
-  if (maxPriorityFeePerGas.lt(nextBaseFee)) {
-    logTrace(
-      strLogPrefix,
-      `maxPriorityFee (${formatUnits(
-        maxPriorityFeePerGas,
-        9
-      )}) gwei < nextBaseFee (${formatUnits(nextBaseFee, 9)}) gwei`
-    );
-    return;
-  }
-
-  // Okay, update backslice tx
-  const backsliceTxSignedWithBribe = await searcherWallet.signTransaction({
-    ...backsliceTx,
-    maxPriorityFeePerGas,
-  });
-
-  // Fire the bundles
-  const bundleResp = await sendBundleFlashbots(
-    [frontsliceTxSigned, middleTx, backsliceTxSignedWithBribe],
-    targetBlockNumber
-  );
-  logSuccess(
-    strLogPrefix,
-    "Bundle submitted!",
-    JSON.stringify(
-      block,
-      targetBlockNumber,
-      nextBaseFee,
-      nonce,
-      sandwichStates,
-      frontsliceTx,
-      maxPriorityFeePerGas,
-      bundleResp
-    )
-  );
 };
 
 const main = async () => {
@@ -301,7 +399,7 @@ const main = async () => {
     "============================================================================\n"
   );
   logInfo(`Searcher Wallet: ${searcherWallet.address}`);
-  logInfo(`Node URL: ${wssProvider.connection.url}\n`);
+  logInfo(`Node URL: ${wssProvider.url}\n`);
   logInfo(
     "============================================================================\n"
   );
@@ -324,11 +422,15 @@ const main = async () => {
   logInfo("Listening to mempool...\n");
 
   // Listen to the mempool on local node
-  wssProvider.on("pending", (txHash) =>
-    sandwichUniswapV2RouterTx(txHash).catch((e) => {
-      logFatal(`txhash=${txHash} error ${JSON.stringify(e)}`);
-    })
-  );
+  function startListening() {
+    provider.on("pending", (txHash) => {
+      if (txHash) {
+        sandwichUniswapV2RouterTx(txHash)
+      }
+    });
+  }
+
+  startListening();
 };
 
 main();

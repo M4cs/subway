@@ -17,13 +17,41 @@ export const parseUniv2RouterTx = (txData) => {
     return null;
   }
 
-  if (data.name !== "swapExactETHForTokens") {
+  if (!data) {
     return null;
+  }
+
+  if (data.name !== "swapExactETHForTokens" || data.name !== "addLiquidityETH") {
+    return null;
+  }
+
+  const isLiqAdd = data.name == "addLiquidityETH";
+
+  if (isLiqAdd) {
+    const [
+      token,
+      amountTokenDesired,
+      amountTokenMin,
+      amountETHMin,
+      to,
+      deadline
+    ] = data.params.map((x) => x.value);
+
+    return {
+      data,
+      token,
+      amountTokenDesired,
+      amountTokenMin,
+      amountETHMin,
+      to,
+      deadline
+    }
   }
 
   const [amountOutMin, path, to, deadline] = data.params.map((x) => x.value);
 
   return {
+    data,
     amountOutMin,
     path,
     to,

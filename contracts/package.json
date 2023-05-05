@@ -6,7 +6,7 @@
   "license": "MIT",
   "dependencies": {
     "@ethersproject/address": "^5.5.0",
-    "ethers": "^5.5.2",
+    "ethers": "^5.4",
     "solc": "0.8.10",
     "yulp": "^0.2.3"
   },
